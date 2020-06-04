@@ -9,6 +9,7 @@ import address from 'https://contracts.webaverse.com/address.js';
 import abi from 'https://contracts.webaverse.com/abi.js';
 import {pe, renderer, scene, camera, container, floorMesh, getSession} from './run.js';
 import {downloadFile, readFile, bindUploadFileButton} from './xrpackage/util.js';
+import {getWireframeMesh} from './volume.js';
 
 const apiHost = `https://ipfs.exokit.org/ipfs`;
 const presenceEndpoint = `wss://presence.exokit.org`;
@@ -22,7 +23,7 @@ const web3 = new Web3(new Web3.providers.HttpProvider(rpcUrl));
 // window.web3 = web3;
 const contract = new web3.eth.Contract(abi, address);
 
-// Ammo().then(async Ammo => {
+Ammo().then(async Ammo => {
 
 const localVector = new THREE.Vector3();
 const localVector2 = new THREE.Vector3();
@@ -88,7 +89,7 @@ const targetMeshGeometry = (() => {
 const targetVsh = `
   #define M_PI 3.1415926535897932384626433832795
   uniform float uTime;
-  varying vec2 vUv;
+  // varying vec2 vUv;
   void main() {
     float f = 1.0 + pow(sin(uTime * M_PI), 0.5) * 0.2;
     gl_Position = projectionMatrix * modelViewMatrix * vec4(position * f, 1.);
@@ -102,7 +103,7 @@ const targetFsh = `
     gl_FragColor = vec4(vec3(f * uHighlight), 1.0);
   }
 `;
-const _makeTargetMesh = () => {
+const _makeTargetMesh = p => {
   const geometry = targetMeshGeometry;
   const material = new THREE.ShaderMaterial({
     uniforms: {
@@ -122,6 +123,15 @@ const _makeTargetMesh = () => {
   const mesh = new THREE.Mesh(geometry, material);
   mesh.frustumCulled = false;
   return mesh;
+};
+const _makeVolumeMesh = async p => {
+  const volumeMesh = await p.getVolumeMesh();
+  if (volumeMesh) {
+    volumeMesh.frustumCulled = false;
+    return volumeMesh;
+  } else {
+    return new THREE.Object3D();
+  }
 };
 
 /* window.downloadTargetMesh = async () => {
@@ -159,12 +169,96 @@ const _makeTargetMesh = () => {
 // pe.defaultAvatar();
 // pe.setGamepadsConnected(true);
 
+let dynamicsWorld = null;
+const _setupPhysics = async () => {
+  var collisionConfiguration = new Ammo.btDefaultCollisionConfiguration();
+  var dispatcher = new Ammo.btCollisionDispatcher(collisionConfiguration);
+  var overlappingPairCache = new Ammo.btDbvtBroadphase();
+  var solver = new Ammo.btSequentialImpulseConstraintSolver();
+  dynamicsWorld = new Ammo.btDiscreteDynamicsWorld(dispatcher, overlappingPairCache, solver, collisionConfiguration);
+  dynamicsWorld.setGravity(new Ammo.btVector3(0, -9.8, 0));
+
+  {
+    var groundShape = new Ammo.btBoxShape(new Ammo.btVector3(10, 10, 10));
+
+    var groundTransform = new Ammo.btTransform();
+    groundTransform.setIdentity();
+    groundTransform.setOrigin(new Ammo.btVector3(0, -10, 0));
+
+    var mass = 0;
+    var localInertia = new Ammo.btVector3(0, 0, 0);
+    var motionState = new Ammo.btDefaultMotionState(groundTransform);
+    var rbInfo = new Ammo.btRigidBodyConstructionInfo(0, motionState, groundShape, localInertia);
+    var body = new Ammo.btRigidBody(rbInfo);
+
+    dynamicsWorld.addRigidBody(body);
+  }
+};
+_setupPhysics();
+
+const _makeConvexHullShape = object => {
+  const shape = new Ammo.btConvexHullShape();
+  // let numPoints = 0;
+  object.updateMatrixWorld();
+  object.traverse(o => {
+    if (o.isMesh) {
+      const {geometry} = o;
+      const positions = geometry.attributes.position.array;
+      for (let i = 0; i < positions.length; i += 3) {
+        localVector.set(positions[i], positions[i+1], positions[i+2])
+          .applyMatrix4(o.matrixWorld);
+        // console.log('point', localVector.x, localVector.y, localVector.z);
+        ammoVector3.setValue(localVector.x, localVector.y, localVector.z);
+        const lastOne = i >= (positions.length - 3);
+        shape.addPoint(ammoVector3, lastOne);
+        // numPoints++;
+      }
+    }
+  });
+  // console.log('sword points', numPoints);
+  return shape;
+};
+const _makeTriangleMeshShape = object => {
+  const triMesh = new Ammo.btTriangleMesh(true, true);
+  object.updateMatrixWorld();
+  object.traverse(o => {
+    if (o.isMesh) {
+      const geometry = o.geometry.toNonIndexed();
+      const positions = geometry.attributes.position.array;
+      for (let i = 0; i < positions.length;) {
+        localVector.set(positions[i++], positions[i++], positions[i++])
+          .applyMatrix4(o.matrixWorld);
+        localVector2.set(positions[i++], positions[i++], positions[i++])
+          .applyMatrix4(o.matrixWorld);
+        localVector3.set(positions[i++], positions[i++], positions[i++])
+          .applyMatrix4(o.matrixWorld);
+        triMesh.addTriangle(
+          new Ammo.btVector3(localVector.x, localVector.y, localVector.z),
+          new Ammo.btVector3(localVector2.x, localVector2.y, localVector2.z),
+          new Ammo.btVector3(localVector3.x, localVector3.y, localVector3.z),
+          false
+        );
+      }
+    }
+  });
+
+  const shape = new Ammo.btBvhTriangleMeshShape(triMesh, true, true);
+  return shape;
+};
+
 const velocity = new THREE.Vector3();
 const lastGrabs = [false, false];
 const lastAxes = [[0, 0], [0, 0]];
+const ammoVector3 = new Ammo.btVector3();
+const ammoQuaternion = new Ammo.btQuaternion();
+const ammoTransform = new Ammo.btTransform();
+let lastTimestamp = performance.now();
 function animate(timestamp, frame) {
   /* const timeFactor = 1000;
   targetMesh.material.uniforms.uTime.value = (Date.now() % timeFactor) / timeFactor; */
+
+  const timeDiff = (timestamp - lastTimestamp) / 1000;
+  lastTimestamp = timestamp;
 
   const currentSession = getSession();
   if (currentSession) {
@@ -289,8 +383,24 @@ function animate(timestamp, frame) {
     pe.setRigMatrix(null);
   }
 
-  // const f = Math.sin((Date.now()%1000)/1000*Math.PI*2);
-  // pe.setMatrix(localMatrix.compose(localVector.set(0, 0, 3 * f), localQuaternion.set(0, 0, 0, 1), localVector2.set(1, 1, 1)));
+  if (physicsEnabled) {
+    dynamicsWorld.stepSimulation(timeDiff, 2);
+
+    for (const p of pe.packages) {
+      if (p.physicsBody) {
+        p.physicsBody.getMotionState().getWorldTransform(ammoTransform);
+        const origin = ammoTransform.getOrigin();
+        const rotation = ammoTransform.getRotation();
+        p.setMatrix(
+          localMatrix.compose(
+            localVector.set(origin.x(), origin.y(), origin.z()),
+            localQuaternion.set(rotation.x(), rotation.y(), rotation.z(), rotation.w()),
+            localVector2.set(1, 1, 1)
+          )
+        );
+      }
+    }
+  }
 
   renderer.render(scene, camera);
 
@@ -621,8 +731,7 @@ document.getElementById('export-scene-button').addEventListener('click', async e
   });
   downloadFile(b, 'scene.wbn');
 });
-let shieldLevel = 1;
-const _placeholdPackage = p => {
+const _placeholdPackage = async p => {
   p.visible = false;
   if (!p.placeholderBox) {
     p.placeholderBox = _makeTargetMesh();
@@ -637,13 +746,38 @@ const _unplaceholdPackage = p => {
     scene.remove(p.placeholderBox);
   }
 };
-document.getElementById('shield-slider').addEventListener('change', e => {
+const _volumePackage = async p => {
+  p.visible = false;
+  if (!p.volumeMesh) {
+    p.volumeMesh = await _makeVolumeMesh(p);
+    p.volumeMesh = getWireframeMesh(p.volumeMesh);
+    p.volumeMesh.package = p;
+    p.volumeMesh.matrix.copy(p.matrix).decompose(p.volumeMesh.position, p.volumeMesh.quaternion, p.volumeMesh.scale);
+  }
+  scene.add(p.volumeMesh);
+};
+const _unvolumePackage = p => {
+  p.visible = true;
+  if (p.volumeMesh) {
+    scene.remove(p.volumeMesh);
+  }
+};
+const _unbindSelectTargets = () => {
+  for (let i = 0; i < selectTargets.length; i++) {
+    const selectTarget = selectTargets[i];
+    selectTarget.control && _unbindTransformControls(selectTarget);
+  }
+};
+const shieldSlider = document.getElementById('shield-slider');
+let shieldLevel = shieldSlider.value;
+shieldSlider.addEventListener('change', async e => {
   const newShieldLevel = parseInt(e.target.value, 10);
   const {packages} = pe;
   switch (newShieldLevel) {
     case 0: {
       for (const p of packages) {
-        _placeholdPackage(p);
+        _unvolumePackage(p);
+        await _placeholdPackage(p);
       }
       shieldLevel = newShieldLevel;
       hoverTarget = null;
@@ -653,15 +787,41 @@ document.getElementById('shield-slider').addEventListener('change', e => {
     case 1: {
       for (const p of packages) {
         _unplaceholdPackage(p);
+        await _volumePackage(p);
       }
+      _unbindSelectTargets();
       shieldLevel = newShieldLevel;
       hoverTarget = null;
-      for (let i = 0; i < selectTargets.length; i++) {
-        const selectTarget = selectTargets[i];
-        selectTarget.control && _unbindTransformControls(selectTarget);
-      }
       selectTargets = [];
       break;
+    }
+    case 2: {
+      for (const p of packages) {
+        _unplaceholdPackage(p);
+        _unvolumePackage(p);
+      }
+      _unbindSelectTargets();
+      shieldLevel = newShieldLevel;
+      hoverTarget = null;
+      selectTargets = [];
+      break;
+    }
+  }
+});
+const enablePhysycsCheckbox = document.getElementById('enable-physics-checkbox');
+let physicsEnabled = enablePhysycsCheckbox.checked;
+enablePhysycsCheckbox.addEventListener('click', e => {
+  physicsEnabled = enablePhysycsCheckbox.checked;
+  if (physicsEnabled) {
+    for (const p of pe.packages) {
+      if (p.physicsBody) {
+        p.matrix.decompose(localVector, localQuaternion, localVector2);
+        const packageTransform = p.physicsBody.getWorldTransform(ammoTransform);
+        ammoVector3.setValue(localVector.x, localVector.y, localVector.z);
+        packageTransform.setOrigin(ammoVector3);
+        ammoQuaternion.setValue(localQuaternion.x, localQuaternion.y, localQuaternion.z, localQuaternion.w);
+        packageTransform.setRotation(ammoQuaternion);
+      }
     }
   }
 });
@@ -683,11 +843,63 @@ const _unbindObject = p => {
 pe.packages.forEach(p => {
   _bindObject(p);
 });
+const wireframeMaterial = new THREE.ShaderMaterial({
+  uniforms: {},
+  vertexShader: `\
+    // attribute vec3 color;
+    attribute vec3 barycentric;
+    varying vec3 vPosition;
+    // varying vec3 vColor;
+    varying vec3 vBC;
+    void main() {
+      // vColor = color;
+      vBC = barycentric;
+      vec4 modelViewPosition = modelViewMatrix * vec4(position, 1.0);
+      vPosition = modelViewPosition.xyz;
+      gl_Position = projectionMatrix * modelViewPosition;
+    }
+  `,
+  fragmentShader: `\
+    uniform sampler2D uCameraTex;
+    varying vec3 vPosition;
+    // varying vec3 vColor;
+    varying vec3 vBC;
+    vec3 color = vec3(0.984313725490196, 0.5490196078431373, 0.0);
+    vec3 lightDirection = vec3(0.0, 0.0, 1.0);
+    float edgeFactor() {
+      vec3 d = fwidth(vBC);
+      vec3 a3 = smoothstep(vec3(0.0), d*1.5, vBC);
+      return min(min(a3.x, a3.y), a3.z);
+    }
+    void main() {
+      // vec3 color = vColor;
+      float barycentricFactor = (0.2 + (1.0 - edgeFactor()) * 0.8);
+      vec3 xTangent = dFdx( vPosition );
+      vec3 yTangent = dFdy( vPosition );
+      vec3 faceNormal = normalize( cross( xTangent, yTangent ) );
+      float lightFactor = dot(faceNormal, lightDirection);
+      gl_FragColor = vec4((0.5 + color * barycentricFactor) * lightFactor, 0.5 + barycentricFactor * 0.5);
+    }
+  `,
+  side: THREE.DoubleSide,
+  /* polygonOffset: true,
+  polygonOffsetFactor: -1,
+  polygonOffsetUnits: -4, */
+  transparent: true,
+  opacity: 0.5,
+  // depthWrite: false,
+  extensions: {
+    derivatives: true,
+  },
+});
 pe.addEventListener('packageadd', async e => {
   const p = e.data;
 
   if (shieldLevel === 0) {
-    _placeholdPackage(p);
+    await _placeholdPackage(p);
+  }
+  if (shieldLevel === 1) {
+    await _volumePackage(p);
   }
   _renderObjects();
 
@@ -703,6 +915,36 @@ pe.addEventListener('packageadd', async e => {
     }
   }
   _bindObject(p);
+
+  const physicsMode = p.getPhysicsMode();
+  if (physicsMode !== null) {
+    const volumeMesh = await p.getVolumeMesh();
+    if (volumeMesh) {
+      p.matrix.decompose(localVector, localQuaternion, localVector2);
+
+      const startTransform = new Ammo.btTransform();
+      startTransform.setIdentity();
+      const originVector = new Ammo.btVector3(localVector.x, localVector.y, localVector.z);
+      startTransform.setOrigin(originVector);
+      const originQuaternion = new Ammo.btQuaternion(localQuaternion.x, localQuaternion.y, localQuaternion.z, localQuaternion.w);
+      startTransform.setRotation(originQuaternion);
+      const mass = physicsMode === 'dynamic' ? 1 : 0;
+      const localInertia = new Ammo.btVector3(0, 0, 0);
+      const shape = physicsMode === 'dynamic' ? _makeConvexHullShape(volumeMesh) : _makeTriangleMeshShape(volumeMesh);
+      if (physicsMode === 'dynamic') {
+        shape.calculateLocalInertia(mass, localInertia);
+      }
+
+      const motionState = new Ammo.btDefaultMotionState(startTransform);
+      const rbInfo = new Ammo.btRigidBodyConstructionInfo(mass, motionState, shape, localInertia);
+      p.physicsBody = new Ammo.btRigidBody(rbInfo);
+      dynamicsWorld.addRigidBody(p.physicsBody);
+    } else {
+      p.physicsBody = null;
+    }
+  } else {
+    p.physicsBody = null;
+  }
 });
 pe.addEventListener('packageremove', e => {
   const p = e.data;
@@ -1411,7 +1653,7 @@ const _renderObjects = () => {
         <h1><nav class=back-button><i class="fa fa-arrow-left"></i></nav>${p.name}</h1>
         <nav class="button reload-button">Reload</nav>
         <nav class="button wear-button">Wear</nav>
-        <nav class="button inspect-button">Inspect</nav>
+        <nav class="button publish-button">Publish</nav>
         <nav class="button remove-button">Remove</nav>
         <b>Position</b>
         <div class=row>
@@ -1492,13 +1734,24 @@ const _renderObjects = () => {
       selectedObject = null;
       _renderObjects();
     });
-    const inspectButton = objectsEl.querySelector('.inspect-button');
-    inspectButton.addEventListener('click', async e => {
-      const b = new Blob([p.data], {
-        type: 'application/webbundle',
+    const publishButton = objectsEl.querySelector('.publish-button');
+    publishButton.addEventListener('click', async e => {
+      const hash = await p.upload();
+      p = {
+        name: p.name,
+        hash,
+      };
+      const res = await fetch(packagesEndpoint + '/' + hash, {
+        method: 'PUT',
+        body: JSON.stringify(p),
       });
-      const u = URL.createObjectURL(b);
-      window.open(`inspect.html?u=${u}`, '_blank');
+      if (res.ok) {
+        packages.innerHTML += '\n' + _makePackageHtml(p);
+        const ps = Array.from(packages.querySelectorAll('.package'));
+        Array.from(packages.querySelectorAll('.package')).forEach(p => _bindPackage(p));
+      } else {
+        console.warn('invalid status code: ' + res.status);
+      }
     });
     const reloadButton = objectsEl.querySelector('.reload-button');
     reloadButton.addEventListener('click', async e => {
@@ -1621,4 +1874,4 @@ window.addEventListener('popstate', e => {
 });
 _handleUrl(window.location.href);
 
-// });
+});
